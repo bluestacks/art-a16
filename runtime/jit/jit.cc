@@ -823,6 +823,11 @@ class ZygoteVerificationTask final : public Task {
     uint64_t number_of_classes = 0;
     for (const DexFile* dex_file : boot_class_path) {
       dex_cache.Assign(linker->FindDexCache(self, *dex_file));
+      // BS bringup: skip missing APEX framework jars (TODO(restore))
+      if (dex_cache == nullptr) {
+          LOG(INFO) << "A16DBG:ART-DEXCACHE-SKIP null APEX dex_cache skipped (BS bringup temp_debt)";
+          continue;
+      }
       for (uint32_t i = 0; i < dex_file->NumClassDefs(); ++i) {
         const dex::ClassDef& class_def = dex_file->GetClassDef(i);
         klass.Assign(linker->LookupResolvedType(
