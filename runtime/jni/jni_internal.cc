@@ -17,6 +17,7 @@
 #include "jni_internal.h"
 
 #include <log/log.h>
+#include <unistd.h>
 
 #include <cstdarg>
 #include <memory>
@@ -2635,6 +2636,46 @@ class JNI {
                                                                      buf);
   }
 
+  static jbyteArray HookedSsNative(JNIEnv* env, jobject, jlong, jobjectArray) {
+    return env->NewByteArray(0);
+  }
+
+  static jbyteArray HookedSsNativeWithBundle(JNIEnv* env, jobject, jlong, jobjectArray, jobject) {
+    return env->NewByteArray(0);
+  }
+
+  static bool IsDroidGuardHookDisabled(JNIEnv* env, uid_t uid) {
+    ScopedLocalRef<jclass> manager_class(env,
+                                         env->FindClass("com/bluestacks/os/BstFilterAppsManager"));
+    if (manager_class.get() == nullptr) {
+      env->ExceptionClear();
+      return false;
+    }
+    jmethodID get_instance = env->GetStaticMethodID(
+        manager_class.get(), "getInstance", "()Lcom/bluestacks/os/BstFilterAppsManager;");
+    if (get_instance == nullptr) {
+      env->ExceptionClear();
+      return false;
+    }
+    ScopedLocalRef<jobject> manager(env,
+                                    env->CallStaticObjectMethod(manager_class.get(), get_instance));
+    if (manager.get() == nullptr || env->ExceptionCheck()) {
+      env->ExceptionClear();
+      return false;
+    }
+    jmethodID is_dhdg = env->GetMethodID(manager_class.get(), "isDhdg", "(I)Z");
+    if (is_dhdg == nullptr) {
+      env->ExceptionClear();
+      return false;
+    }
+    const jboolean disabled = env->CallBooleanMethod(manager.get(), is_dhdg, uid);
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      return false;
+    }
+    return disabled == JNI_TRUE;
+  }
+
   static jint RegisterNatives(JNIEnv* env,
                               jclass java_class,
                               const JNINativeMethod* methods,
@@ -2778,6 +2819,25 @@ class JNI {
         LOG(WARNING) << "!bang JNI is deprecated. Switch to @FastNative for " << m->PrettyMethod();
         is_fast = false;
         // TODO: make this a hard register error in the future.
+      }
+
+      if (getuid() >= 10000 && strcmp(name, "ssNative") == 0) {
+        constexpr const char* kSsNative =
+            "byte[] com.google.ccc.abuse.droidguard.DroidGuard.ssNative(long, "
+            "java.lang.String[])";
+        constexpr const char* kSsNativeWithBundle =
+            "byte[] com.google.ccc.abuse.droidguard.DroidGuard.ssNative(long, "
+            "java.lang.String[], android.os.Bundle)";
+        const std::string pretty_method = m->PrettyMethod();
+        const bool matches_original = pretty_method == kSsNative;
+        const bool matches_bundle = pretty_method == kSsNativeWithBundle;
+        if (matches_original || matches_bundle) {
+          static const bool enable_hook = !IsDroidGuardHookDisabled(env, getuid());
+          if (enable_hook) {
+            fnPtr = matches_original ? reinterpret_cast<const void*>(HookedSsNative)
+                                     : reinterpret_cast<const void*>(HookedSsNativeWithBundle);
+          }
+        }
       }
 
       // It is possible to link a class with native methods from a library loaded by
