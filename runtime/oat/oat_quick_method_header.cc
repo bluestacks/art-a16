@@ -52,11 +52,13 @@ uint32_t OatQuickMethodHeader::ToDexPc(ArtMethod** frame,
     }
   }
   if (abort_on_failure) {
-    LOG(FATAL) << "Failed to find Dex offset for PC offset "
-           << reinterpret_cast<void*>(sought_offset)
-           << "(PC " << reinterpret_cast<void*>(pc) << ", entry_point=" << entry_point
-           << " current entry_point=" << method->GetEntryPointFromQuickCompiledCode()
-           << ") in " << method->PrettyMethod();
+    // Some translated 64-bit frames do not have a matching stack map. Keep the A13 recovery
+    // behavior so a diagnostic failure does not abort the guest during boot or unwinding.
+    LOG(ERROR) << "Failed to find Dex offset for PC offset "
+               << reinterpret_cast<void*>(sought_offset) << "(PC " << reinterpret_cast<void*>(pc)
+               << ", entry_point=" << entry_point
+               << " current entry_point=" << method->GetEntryPointFromQuickCompiledCode() << ") in "
+               << method->PrettyMethod();
   }
   return dex::kDexNoIndex;
 }
