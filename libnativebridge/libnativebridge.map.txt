@@ -24,6 +24,7 @@ LIBNATIVEBRIDGE_1 {
     PreInitializeNativeBridge; # apex
     NativeBridgeAvailable; # apex
     NeedsNativeBridge; # apex
+    bst_nbpname;
   local:
     *;
 };

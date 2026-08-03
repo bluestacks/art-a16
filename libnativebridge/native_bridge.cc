@@ -22,10 +22,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstring>
+#include <string>
 
 #include "android-base/macros.h"
 #include "log/log.h"
@@ -298,14 +301,77 @@ bool NeedsNativeBridge(const char* instruction_set) {
   return strncmp(instruction_set, ABI_STRING, strlen(ABI_STRING) + 1) != 0;
 }
 
-bool PreInitializeNativeBridge(const char* app_data_dir_in,
-                               [[maybe_unused]] const char* instruction_set) {
+#ifdef ART_TARGET_ANDROID
+static bool BindMountCpuinfo(const char* source) {
+  const bool proc_mounted =
+      TEMP_FAILURE_RETRY(mount(source, "/proc/cpuinfo", nullptr, MS_BIND, nullptr)) == 0;
+  if (!proc_mounted) {
+    ALOGW("Failed to bind-mount %s as /proc/cpuinfo: %s", source, strerror(errno));
+  }
+
+  if (TEMP_FAILURE_RETRY(mount(source, "/etc/cpuinfo", nullptr, MS_BIND, nullptr)) == -1) {
+    ALOGW("Failed to bind-mount %s as /etc/cpuinfo: %s", source, strerror(errno));
+  }
+  return proc_mounted;
+}
+#endif
+
+static void MountCpuinfoForInstructionSet(const char* instruction_set) {
+  if (instruction_set == nullptr || strlen(instruction_set) > 10) {
+    if (instruction_set != nullptr) {
+      ALOGW("Instruction set %s is malformed", instruction_set);
+    }
+    return;
+  }
+
+#ifdef ART_TARGET_ANDROID
+  char path[512];
+  snprintf(path, sizeof(path), "/data/downloads/.oh/cpuinfo/%s/cpuinfo", instruction_set);
+  if (BindMountCpuinfo(path)) {
+    return;
+  }
+
+  snprintf(path, sizeof(path), "/system/etc/houdini/cpuinfo.%s.txt", instruction_set);
+  if (BindMountCpuinfo(path)) {
+    return;
+  }
+
+  snprintf(path, sizeof(path), "/system/etc/cpuinfo.%s.txt", instruction_set);
+  if (BindMountCpuinfo(path)) {
+    return;
+  }
+
+#ifdef __LP64__
+  snprintf(path, sizeof(path), "/system/lib64/%s/cpuinfo", instruction_set);
+#else
+  snprintf(path, sizeof(path), "/system/lib/%s/cpuinfo", instruction_set);
+#endif
+  BindMountCpuinfo(path);
+#endif
+}
+
+static char g_package_name[256];
+
+extern "C" const char* bst_nbpname() { return g_package_name; }
+
+static void InitializePackageName(const char* app_data_dir) {
+  g_package_name[0] = '\0';
+  if (app_data_dir == nullptr) {
+    return;
+  }
+  const char* last_separator = strrchr(app_data_dir, '/');
+  const char* package_name = last_separator == nullptr ? app_data_dir : last_separator + 1;
+  snprintf(g_package_name, sizeof(g_package_name), "%s", package_name);
+}
+
+bool PreInitializeNativeBridge(const char* app_data_dir_in, const char* instruction_set) {
   if (g_state != NativeBridgeState::kOpened) {
     ALOGE("Invalid state: native bridge is expected to be opened.");
     CloseNativeBridge(true);
     return false;
   }
 
+  InitializePackageName(app_data_dir_in);
   if (app_data_dir_in != nullptr) {
     // Create the path to the application code cache directory.
     // The memory will be release after Initialization or when the native bridge is closed.
@@ -316,6 +382,9 @@ bool PreInitializeNativeBridge(const char* app_data_dir_in,
     ALOGW("Application private directory isn't available.");
     g_app_code_cache_dir = nullptr;
   }
+
+  // Failure is non-fatal. The translated runtime can still initialize with the platform fallback.
+  MountCpuinfoForInstructionSet(instruction_set);
 
   g_state = NativeBridgeState::kPreInitialized;
   return true;
@@ -330,6 +399,105 @@ void PreZygoteForkNativeBridge() {
             PRE_ZYGOTE_FORK_VERSION);
     }
   }
+}
+
+static bool UidListedInFile(const char* path, uid_t uid) {
+#ifdef ART_TARGET_ANDROID
+  FILE* file = fopen(path, "re");
+  if (file == nullptr) {
+    return false;
+  }
+
+  char line[64];
+  bool found = false;
+  while (fgets(line, sizeof(line), file) != nullptr) {
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long value = strtoul(line, &end, 10);
+    if (errno == 0 && end != line && value == uid) {
+      found = true;
+      break;
+    }
+  }
+  fclose(file);
+  return found;
+#else
+  (void)path;
+  (void)uid;
+  return false;
+#endif
+}
+
+static void SetCpuAbi(JNIEnv* env, jclass build_class, const char* field, const char* value) {
+  if (value == nullptr) {
+    return;
+  }
+  jfieldID field_id = env->GetStaticFieldID(build_class, field, "Ljava/lang/String;");
+  if (field_id == nullptr) {
+    env->ExceptionClear();
+    ALOGW("Could not find Build.%s", field);
+    return;
+  }
+  jstring string_value = env->NewStringUTF(value);
+  if (string_value == nullptr) {
+    env->ExceptionClear();
+    return;
+  }
+  env->SetStaticObjectField(build_class, field_id, string_value);
+}
+
+static bool SetStringArrayField(JNIEnv* env,
+                                jclass build_class,
+                                const char* field,
+                                const char* const* values,
+                                size_t value_count) {
+  jfieldID field_id = env->GetStaticFieldID(build_class, field, "[Ljava/lang/String;");
+  if (field_id == nullptr) {
+    env->ExceptionClear();
+    ALOGW("Could not find Build.%s", field);
+    return false;
+  }
+  jclass string_class = env->FindClass("java/lang/String");
+  if (string_class == nullptr) {
+    env->ExceptionClear();
+    return false;
+  }
+  jobjectArray array = env->NewObjectArray(static_cast<jsize>(value_count), string_class, nullptr);
+  if (array == nullptr) {
+    env->ExceptionClear();
+    return false;
+  }
+  for (size_t i = 0; i < value_count; ++i) {
+    jstring value = env->NewStringUTF(values[i]);
+    if (value == nullptr) {
+      env->ExceptionClear();
+      return false;
+    }
+    env->SetObjectArrayElement(array, i, value);
+  }
+  env->SetStaticObjectField(build_class, field_id, array);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return false;
+  }
+  return true;
+}
+
+static void SetCpuAbiList(JNIEnv* env, jclass build_class) {
+  static constexpr const char* kArm32Abis[] = {"armeabi-v7a", "armeabi"};
+#ifdef __LP64__
+  static constexpr const char* kArm64Abis[] = {"arm64-v8a"};
+  static constexpr const char* kAllArmAbis[] = {"arm64-v8a", "armeabi-v7a", "armeabi"};
+  if (!SetStringArrayField(env, build_class, "SUPPORTED_ABIS", kAllArmAbis, 3) ||
+      !SetStringArrayField(env, build_class, "SUPPORTED_64_BIT_ABIS", kArm64Abis, 1)) {
+    return;
+  }
+#else
+  if (!SetStringArrayField(env, build_class, "SUPPORTED_ABIS", kArm32Abis, 2)) {
+    return;
+  }
+#endif
+  SetStringArrayField(env, build_class, "SUPPORTED_32_BIT_ABIS", kArm32Abis, 2);
 }
 
 // Set up the environment for the bridged app.
@@ -353,6 +521,24 @@ static void SetupEnvironment(const NativeBridgeCallbacks* cbs, JNIEnv* env, cons
     ALOGW("Out of memory while setting up app environment.");
     env->ExceptionClear();
     return;
+  }
+
+  constexpr const char* kXarchApps = "/data/downloads/.tmp/.bstXarchApps";
+  constexpr const char* kAbilistApps = "/data/downloads/.tmp/.bstAbilistApps";
+  if (!UidListedInFile(kXarchApps, getuid()) &&
+      (env_values->cpu_abi != nullptr || env_values->cpu_abi2 != nullptr ||
+       env_values->abi_count >= 0)) {
+    jclass build_class = env->FindClass("android/os/Build");
+    if (build_class != nullptr) {
+      SetCpuAbi(env, build_class, "CPU_ABI", env_values->cpu_abi);
+      SetCpuAbi(env, build_class, "CPU_ABI2", env_values->cpu_abi2);
+      if (UidListedInFile(kAbilistApps, getuid())) {
+        SetCpuAbiList(env, build_class);
+      }
+    } else {
+      env->ExceptionClear();
+      ALOGW("Could not find Build class");
+    }
   }
 
   if (env_values->os_arch != nullptr) {
@@ -621,10 +807,162 @@ native_bridge_namespace_t* NativeBridgeGetExportedNamespace(const char* name) {
   return nullptr;
 }
 
+class NativeBridgeLibraryHandle {
+ public:
+  explicit NativeBridgeLibraryHandle(void* handle) : handle_(handle) {}
+  ~NativeBridgeLibraryHandle() {
+    if (handle_ != nullptr) {
+      NativeBridgeUnloadLibrary(handle_);
+    }
+  }
+
+  NativeBridgeLibraryHandle(const NativeBridgeLibraryHandle&) = delete;
+  NativeBridgeLibraryHandle& operator=(const NativeBridgeLibraryHandle&) = delete;
+
+ private:
+  void* handle_;
+};
+
+#if defined(__LP64__) && defined(ART_TARGET_ANDROID)
+static bool ReadSmallFile(const char* path, std::string* contents) {
+  constexpr off_t kMaximumSize = 1024 * 1024;
+  FILE* file = fopen(path, "re");
+  if (file == nullptr) {
+    return false;
+  }
+
+  struct stat status;
+  if (fstat(fileno(file), &status) != 0 || !S_ISREG(status.st_mode) || status.st_size <= 0 ||
+      status.st_size > kMaximumSize) {
+    fclose(file);
+    return false;
+  }
+
+  contents->resize(status.st_size);
+  const size_t bytes_read = fread(contents->data(), 1, contents->size(), file);
+  fclose(file);
+  if (bytes_read != contents->size()) {
+    contents->clear();
+    return false;
+  }
+  return true;
+}
+
+static bool PackageListed(const char* path, const char* package_name) {
+  if (package_name == nullptr || package_name[0] == '\0') {
+    return false;
+  }
+  std::string contents;
+  if (!ReadSmallFile(path, &contents)) {
+    return false;
+  }
+
+  size_t start = 0;
+  while (start <= contents.size()) {
+    const size_t end = contents.find(';', start);
+    const size_t length = (end == std::string::npos ? contents.size() : end) - start;
+    if (length == strlen(package_name) && contents.compare(start, length, package_name) == 0) {
+      return true;
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+#endif
+
+static void* LoadPmfLibrary(native_bridge_namespace_t* ns) {
+#if defined(__LP64__) && defined(ART_TARGET_ANDROID)
+  constexpr const char* kPmfApps = "/data/downloads/.tmp/.pmf";
+  if (PackageListed(kPmfApps, g_package_name)) {
+    return g_callbacks->loadLibraryExt("/data/downloads/libpmf.so", RTLD_NOW, ns);
+  }
+#else
+  (void)ns;
+#endif
+  return nullptr;
+}
+
+class HotFixHooks {
+ public:
+  explicit HotFixHooks(const char* package_name) {
+#ifdef ART_TARGET_ANDROID
+    if (package_name == nullptr || package_name[0] == '\0') {
+      return;
+    }
+
+    void* binder = OpenSystemLibrary("libbinder.so", RTLD_NOW);
+    if (binder == nullptr) {
+      return;
+    }
+    using IsHotFixApp = bool (*)(const char*);
+    IsHotFixApp is_hotfix_app = reinterpret_cast<IsHotFixApp>(dlsym(binder, "bstIsHotFixApp"));
+    const bool enabled = is_hotfix_app != nullptr && is_hotfix_app(package_name);
+    dlclose(binder);
+    if (!enabled) {
+      return;
+    }
+
+    constexpr const char* kLibrary = sizeof(void*) == 8 ? "/data/downloads/.hpp/libhpp64.so"
+                                                        : "/data/downloads/.hpp/libhpp32.so";
+    handle_ = OpenSystemLibrary(kLibrary, RTLD_NOW);
+    if (handle_ == nullptr) {
+      return;
+    }
+    after_load_ = reinterpret_cast<PatchFunction>(dlsym(handle_, "hppa"));
+    before_load_ = reinterpret_cast<PatchFunction>(dlsym(handle_, "hppb"));
+    if (after_load_ == nullptr || before_load_ == nullptr) {
+      dlclose(handle_);
+      handle_ = nullptr;
+      after_load_ = nullptr;
+      before_load_ = nullptr;
+    }
+#else
+    (void)package_name;
+#endif
+  }
+
+  ~HotFixHooks() {
+    if (handle_ != nullptr) {
+      dlclose(handle_);
+    }
+  }
+
+  void BeforeLoad(const char* library) const {
+    if (before_load_ != nullptr) {
+      before_load_(library);
+    }
+  }
+
+  void AfterLoad(const char* library) const {
+    if (after_load_ != nullptr) {
+      after_load_(library);
+    }
+  }
+
+  HotFixHooks(const HotFixHooks&) = delete;
+  HotFixHooks& operator=(const HotFixHooks&) = delete;
+
+ private:
+  using PatchFunction = void (*)(const char*);
+  void* handle_ = nullptr;
+  PatchFunction after_load_ = nullptr;
+  PatchFunction before_load_ = nullptr;
+};
+
 void* NativeBridgeLoadLibraryExt(const char* libpath, int flag, native_bridge_namespace_t* ns) {
   if (NativeBridgeInitialized()) {
     if (isCompatibleWith(NAMESPACE_VERSION)) {
-      return g_callbacks->loadLibraryExt(libpath, flag, ns);
+      static const NativeBridgeLibraryHandle pmf_library(LoadPmfLibrary(ns));
+      static const HotFixHooks hotfix_hooks(g_package_name);
+      hotfix_hooks.BeforeLoad(libpath);
+      void* handle = g_callbacks->loadLibraryExt(libpath, flag, ns);
+      if (handle != nullptr) {
+        hotfix_hooks.AfterLoad(libpath);
+      }
+      return handle;
     } else {
       ALOGE("not compatible with version %d, cannot load library in namespace", NAMESPACE_VERSION);
     }

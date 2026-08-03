@@ -74,6 +74,12 @@ const char* NativeBridgeGetError() {
   return f();
 }
 
+extern "C" const char* bst_nbpname() {
+  using PackageNameFunction = const char* (*)();
+  static auto f = GetFuncPtr<PackageNameFunction>("bst_nbpname");
+  return f();
+}
+
 #undef GET_FUNC_PTR
 
 }  // namespace android
