@@ -20,15 +20,16 @@
 
 #include "native_loader_namespace.h"
 
-#include <dlfcn.h>
-
-#include <functional>
-
 #include <android-base/strings.h>
+#include <bionic/dlext_namespaces.h>
+#include <dlfcn.h>
 #include <log/log.h>
 #include <nativebridge/native_bridge.h>
+#include <stdlib.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
 
-#include <bionic/dlext_namespaces.h>
+#include <functional>
 
 using android::base::Error;
 
@@ -163,8 +164,162 @@ Result<void> NativeLoaderNamespace::Link(const NativeLoaderNamespace* target,
   return Error() << GetLinkerError(IsBridged());
 }
 
+namespace {
+
+void* OpenSystemLibrary(const char* path, int flags) {
+  android_namespace_t* system_ns = android_get_exported_namespace(kSystemNamespaceName);
+  if (system_ns == nullptr) {
+    system_ns = android_get_exported_namespace(kDefaultNamespaceName);
+    LOG_ALWAYS_FATAL_IF(
+        system_ns == nullptr, "Failed to get system namespace for loading %s", path);
+  }
+  const android_dlextinfo extinfo = {
+      .flags = ANDROID_DLEXT_USE_NAMESPACE,
+      .library_namespace = system_ns,
+  };
+  return android_dlopen_ext(path, flags, &extinfo);
+}
+
+bool IsHighFpsEnabled() {
+  char value[PROP_VALUE_MAX] = {};
+  return __system_property_get("bst.enable_high_fps", value) == 1 && value[0] == '1';
+}
+
+int GetExtendedPerformanceMode(bool check_process_name) {
+  if (getuid() < 10000) {
+    return 0;
+  }
+  const char* process_name = getprogname();
+  if (check_process_name && process_name != nullptr && strcmp(process_name, "chrome_zygote") == 0) {
+    return 0;
+  }
+
+  void* handle = OpenSystemLibrary("libbinder.so", RTLD_NOLOAD);
+  if (handle == nullptr) {
+    return 0;
+  }
+  using GetMode = int (*)(int);
+  GetMode get_mode = reinterpret_cast<GetMode>(dlsym(handle, "bst_getXPerfMode"));
+  const int mode = get_mode != nullptr ? get_mode(getuid()) : 0;
+  dlclose(handle);
+  return mode;
+}
+
+template <bool kUseNativeBridge>
+class HighFpsHookLibrary {
+ public:
+  explicit HighFpsHookLibrary(const NativeLoaderNamespace& ns) {
+    const int mode = GetExtendedPerformanceMode(!kUseNativeBridge);
+    if (!((IsHighFpsEnabled() && mode == 1) || mode == 2)) {
+      return;
+    }
+
+    constexpr const char* kArmLibrary =
+        sizeof(void*) == 8 ? "/data/downloads/.xp/lib64/arm64/libstagefright_httpcommon.so"
+                           : "/data/downloads/.xp/lib/arm/libstagefright_httpcommon.so";
+    constexpr const char* kX86Library =
+        sizeof(void*) == 8 ? "/data/downloads/.xp/lib64/libstagefright_httpcommon.so"
+                           : "/data/downloads/.xp/lib/libstagefright_httpcommon.so";
+    const char* library = kUseNativeBridge ? kArmLibrary : kX86Library;
+    if (access(library, F_OK) != 0) {
+      return;
+    }
+
+    if constexpr (kUseNativeBridge) {
+      handle_ = NativeBridgeLoadLibraryExt(library, RTLD_NOW, ns.ToRawNativeBridgeNamespace());
+    } else {
+      const android_dlextinfo extinfo = {
+          .flags = ANDROID_DLEXT_USE_NAMESPACE,
+          .library_namespace = ns.ToRawAndroidNamespace(),
+      };
+      handle_ = android_dlopen_ext(library, RTLD_NOW, &extinfo);
+    }
+  }
+
+  ~HighFpsHookLibrary() {
+    if (handle_ == nullptr) {
+      return;
+    }
+    if constexpr (kUseNativeBridge) {
+      NativeBridgeUnloadLibrary(handle_);
+    } else {
+      dlclose(handle_);
+    }
+  }
+
+  HighFpsHookLibrary(const HighFpsHookLibrary&) = delete;
+  HighFpsHookLibrary& operator=(const HighFpsHookLibrary&) = delete;
+
+ private:
+  void* handle_ = nullptr;
+};
+
+bool IsHotFixApp() {
+  if (getuid() < 10000) {
+    return false;
+  }
+  const char* process_name = getprogname();
+  if (process_name != nullptr && strcmp(process_name, "chrome_zygote") == 0) {
+    return false;
+  }
+
+  void* handle = OpenSystemLibrary("libbinder.so", RTLD_NOLOAD);
+  if (handle == nullptr) {
+    return false;
+  }
+  using IsHotFixAppByUid = bool (*)(int32_t);
+  IsHotFixAppByUid is_hotfix_app =
+      reinterpret_cast<IsHotFixAppByUid>(dlsym(handle, "bstIsHotFixAppByUid"));
+  const bool result = is_hotfix_app != nullptr && is_hotfix_app(getuid());
+  dlclose(handle);
+  return result;
+}
+
+class HotFixHookLibrary {
+ public:
+  explicit HotFixHookLibrary(const NativeLoaderNamespace& ns) {
+    if (!IsHotFixApp()) {
+      return;
+    }
+    constexpr const char* kLibrary = sizeof(void*) == 8 ? "/data/downloads/.hpp/libhpp64.so"
+                                                        : "/data/downloads/.hpp/libhpp32.so";
+    if (access(kLibrary, F_OK) != 0) {
+      return;
+    }
+
+    const android_dlextinfo extinfo = {
+        .flags = ANDROID_DLEXT_USE_NAMESPACE,
+        .library_namespace = ns.ToRawAndroidNamespace(),
+    };
+    handle_ = android_dlopen_ext(kLibrary, RTLD_NOW, &extinfo);
+    if (handle_ != nullptr) {
+      using InstallHooks = void (*)();
+      InstallHooks install_hooks = reinterpret_cast<InstallHooks>(dlsym(handle_, "hook_x86App"));
+      if (install_hooks != nullptr) {
+        install_hooks();
+      }
+    }
+  }
+
+  ~HotFixHookLibrary() {
+    if (handle_ != nullptr) {
+      dlclose(handle_);
+    }
+  }
+
+  HotFixHookLibrary(const HotFixHookLibrary&) = delete;
+  HotFixHookLibrary& operator=(const HotFixHookLibrary&) = delete;
+
+ private:
+  void* handle_ = nullptr;
+};
+
+}  // namespace
+
 Result<void*> NativeLoaderNamespace::Load(const char* lib_name) const {
   if (!IsBridged()) {
+    static const HighFpsHookLibrary<false> high_fps_hook(*this);
+    static const HotFixHookLibrary hotfix_hook(*this);
     android_dlextinfo extinfo;
     extinfo.flags = ANDROID_DLEXT_USE_NAMESPACE;
     extinfo.library_namespace = this->ToRawAndroidNamespace();
@@ -173,6 +328,7 @@ Result<void*> NativeLoaderNamespace::Load(const char* lib_name) const {
       return handle;
     }
   } else {
+    static const HighFpsHookLibrary<true> high_fps_hook(*this);
     void* handle =
         NativeBridgeLoadLibraryExt(lib_name, RTLD_NOW, this->ToRawNativeBridgeNamespace());
     if (handle != nullptr) {
