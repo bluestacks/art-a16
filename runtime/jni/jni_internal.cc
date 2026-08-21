@@ -22,6 +22,7 @@
 #include <cstdarg>
 #include <memory>
 #include <utility>
+#include <cstring>
 
 #include "art_field-inl.h"
 #include "art_method-alloc-inl.h"
@@ -2636,11 +2637,58 @@ class JNI {
                                                                      buf);
   }
 
-  static jbyteArray HookedSsNative(JNIEnv* env, jobject, jlong, jobjectArray) {
+  // BS-A16 (BAM-868): selective DroidGuard blocking — check the first
+  // string arg to decide whether to let the call through or return empty.
+  typedef jbyteArray (*SsNativeFunc)(JNIEnv*, jobject, jlong, jobjectArray);
+  typedef jbyteArray (*SsNativeWithBundleFunc)(JNIEnv*, jobject, jlong, jobjectArray, jobject);
+
+  inline static SsNativeFunc original_ss_native = nullptr;
+  inline static SsNativeWithBundleFunc original_ss_native_with_bundle = nullptr;
+
+  static bool ShouldBlockDroidGuardKey(const char* chars) {
+    return strcmp(chars, "dg_minutemaid") == 0 ||
+           strcmp(chars, "gmphn_binding_key") == 0 ||
+           strcmp(chars, "AdAttestationContentBinding") == 0 ||
+           strcmp(chars, "CONTENT_BINDER") == 0;
+  }
+
+  static bool ShouldBlockDroidGuardCall(JNIEnv* env, jobjectArray arr) {
+    if (arr == nullptr || env->GetArrayLength(arr) == 0) {
+      return false;
+    }
+    ScopedLocalRef<jstring> str_obj(
+        env, static_cast<jstring>(env->GetObjectArrayElement(arr, 0)));
+    if (str_obj.get() == nullptr) {
+      return false;
+    }
+    const char* chars = env->GetStringUTFChars(str_obj.get(), nullptr);
+    if (chars == nullptr) {
+      return true;  // OOM, block to be safe
+    }
+    const bool block = strstr(chars, "droid_guard_session_token_") != nullptr ||
+                       ShouldBlockDroidGuardKey(chars);
+    env->ReleaseStringUTFChars(str_obj.get(), chars);
+    return block;
+  }
+
+  static jbyteArray HookedSsNative(JNIEnv* env, jobject jo, jlong handle, jobjectArray arr) {
+    if (ShouldBlockDroidGuardCall(env, arr)) {
+      return env->NewByteArray(0);
+    }
+    if (original_ss_native != nullptr) {
+      return original_ss_native(env, jo, handle, arr);
+    }
     return env->NewByteArray(0);
   }
 
-  static jbyteArray HookedSsNativeWithBundle(JNIEnv* env, jobject, jlong, jobjectArray, jobject) {
+  static jbyteArray HookedSsNativeWithBundle(JNIEnv* env, jobject jo, jlong handle,
+                                              jobjectArray arr, jobject bundle) {
+    if (ShouldBlockDroidGuardCall(env, arr)) {
+      return env->NewByteArray(0);
+    }
+    if (original_ss_native_with_bundle != nullptr) {
+      return original_ss_native_with_bundle(env, jo, handle, arr, bundle);
+    }
     return env->NewByteArray(0);
   }
 
@@ -2834,8 +2882,18 @@ class JNI {
         if (matches_original || matches_bundle) {
           static const bool enable_hook = !IsDroidGuardHookDisabled(env, getuid());
           if (enable_hook) {
-            fnPtr = matches_original ? reinterpret_cast<const void*>(HookedSsNative)
-                                     : reinterpret_cast<const void*>(HookedSsNativeWithBundle);
+            // BS-A16 (BAM-868): save the original so we can pass through
+            // non-blocked calls instead of unconditionally returning empty.
+            if (matches_original) {
+              original_ss_native = reinterpret_cast<SsNativeFunc>(
+                  const_cast<void*>(fnPtr));
+              fnPtr = reinterpret_cast<const void*>(HookedSsNative);
+            }
+            if (matches_bundle) {
+              original_ss_native_with_bundle = reinterpret_cast<SsNativeWithBundleFunc>(
+                  const_cast<void*>(fnPtr));
+              fnPtr = reinterpret_cast<const void*>(HookedSsNativeWithBundle);
+            }
           }
         }
       }
