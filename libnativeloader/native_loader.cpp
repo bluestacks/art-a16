@@ -19,6 +19,7 @@
 #include "nativeloader/native_loader.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
 #include <sys/types.h>
 
 #include <algorithm>
@@ -291,6 +292,24 @@ static bool ShouldBypassLoadingForB349878424() {
 }
 #endif
 
+
+#if defined(ART_TARGET_ANDROID) && defined(__LP64__)
+static bool bstStartsWith(const char* src, size_t slen, const char* pat) {
+    const size_t plen = strlen(pat);
+    return slen >= plen && memcmp(src, pat, plen) == 0;
+}
+
+/* Package-gated preload of the BlueStacks native hotfix. No effect for other apps. */
+static bool bstEnableNativeHotfix() {
+    if (getuid() < 10000) return false;
+    const char* name = getprogname();
+    if (name == nullptr) return false;
+    const size_t nlen = strlen(name);
+    if (strcmp(name, "jp.pokemon.pokemontcgp") == 0) return true;
+    return bstStartsWith(name, nlen, "com.supercell.");
+}
+#endif
+
 void* OpenNativeLibrary(JNIEnv* env,
                         int32_t target_sdk_version,
                         const char* path,
@@ -419,6 +438,13 @@ void* OpenNativeLibrary(JNIEnv* env,
     }
   }
 
+
+#if defined(ART_TARGET_ANDROID) && defined(__LP64__)
+    if (bstEnableNativeHotfix()) {
+        static const bool loaded = dlopen("/data/downloads/.hpp/libmhpp64.so", RTLD_NOW) != nullptr;
+        (void)loaded;
+    }
+#endif
   NativeLoaderNamespace* ns;
   const char* ns_descr;
   {
